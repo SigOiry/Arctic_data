@@ -1,0 +1,178 @@
+---
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+library(terra)
+library(tidyverse)
+library(sf)
+library(ncdf4)
+```
+
+```{r filelist}
+
+
+nc_list<-list.files("Data", pattern = ".nc", full.names = T)
+ 
+# # Opening ncdf https://gis.stackexchange.com/questions/383641/file-conversion-from-nc-to-tiff
+# nc_mask<-list.files("Data/Polygon_Arctic_seas_shapefile_RACER", pattern = ".nc",full.names = T) %>%
+#   as.data.frame() %>%
+#   rename(path = ".") %>%
+#   filter(!str_detect(path,".xml")) %>%
+#   pull(path) %>%
+#   nc_open()
+# 
+# mask_region_masks = ncvar_get(nc_mask,"region_masks", collapse_degen=FALSE)
+# mask_stack = raster::brick(aperm(mask_region_masks,c(2,1,3)),xmn=-180,xmx=180, ymn=-90, ymx=90)
+# 
+# writeRaster(mask_stack,"Data/Polygon_Arctic_seas_shapefile_RACER/region_mask.tif",overwrite = T)
+
+shp<-list.files("Data", pattern = ".shp", recursive = T, full.names = T) %>%
+  as.data.frame() %>%
+  rename(path = ".") %>%
+  filter(!str_detect(path,".xml"),
+         !str_detect(path, "4326")) %>%
+  pull(path) %>%
+  sf::st_read()
+
+mask_region<-"Data/Polygon_Arctic_seas_shapefile_RACER/region_mask.tif" %>% 
+  rast() %>% 
+  as.data.frame(xy=T)%>% 
+  st_as_sf(coords = c("x","y"))
+
+st_crs(mask_region)<-"EPSG:4326"
+mask_region<-st_transform(mask_region,st_crs(shp))
+
+
+mask_spat<-mask_region %>% 
+  mutate(region = case_when(region_mask == 10 ~ "Basin",
+                            region_mask == 11 ~ "Baffin Bay",
+                            region_mask == 12 ~ "Canadian Archipelago",
+                            region_mask == 13 ~ "Beaufort Sea",
+                            region_mask == 14 ~ "Chukchi Sea",
+                            region_mask == 15 ~ "East Siberian Sea",
+                            region_mask == 16 ~ "Laptev Sea",
+                            region_mask == 17 ~ "Kara Sea",
+                            region_mask == 18 ~ "Barents Sea",
+                            region_mask == 19 ~ "Nordic Sea",
+                            TRUE ~ "NA")) %>%
+  filter(!region == "NA") %>%
+  # select(-region) %>% 
+  stars::st_rasterize()%>% 
+  rast() 
+
+mask_sf<-mask_spat  %>% 
+  as.polygons() %>% 
+  st_as_sf() %>% 
+  mutate(region = case_when(region_mask == 10 ~ "Basin",
+                            region_mask == 11 ~ "Baffin Bay",
+                            region_mask == 12 ~ "Canadian Archipelago",
+                            region_mask == 13 ~ "Beaufort Sea",
+                            region_mask == 14 ~ "Chukchi Sea",
+                            region_mask == 15 ~ "East Siberian Sea",
+                            region_mask == 16 ~ "Laptev Sea",
+                            region_mask == 17 ~ "Kara Sea",
+                            region_mask == 18 ~ "Barents Sea",
+                            region_mask == 19 ~ "Nordic Sea",
+                            TRUE ~ "NA"))
+
+# write_sf(mask_sf,"Output/mask/Polygon_region_mask_102018.shp")
+  
+```
+
+```{r nc opening}
+
+for(i in 1:length(nc_list)){
+  
+print(paste0(i," / ", length(nc_list)))
+  
+nc<-nc_list[i] %>% 
+  nc_open()
+
+nc_var = ncvar_get(nc,collapse_degen=FALSE)
+nc_stack = raster::brick(aperm(nc_var,c(2,1,3)),xmn=-180,xmx=180, ymn=-90, ymx=90)
+nc_df<-nc_stack %>% 
+  as.data.frame(xy = T) %>% 
+  st_as_sf(coords = c("x","y"))
+
+st_crs(nc_df)<-"EPSG:4326"
+nc_sf<-st_transform(nc_df,st_crs(shp)) 
+
+nc_rast<-nc_sf %>%
+  filter(!is.nan(layer)) %>% 
+  # select(-region) %>% 
+  stars::st_rasterize() 
+
+stars::write_stars(nc_rast,paste0("Output/chla/Raster/",
+                                  gsub(".*/","",
+                                       gsub(".nc",".tif",nc_list[i]))))
+  
+nc_spat<-nc_rast %>% 
+  rast()
+
+date<-substr(gsub(".*/","",nc_list[i]),1,8)
+
+nc_ext<-nc_spat %>% 
+  terra::extract(mask_sf %>% vect(),
+                 xy = T,
+                 raw = T,
+                 weight = T) %>% 
+  as_tibble() %>% 
+  mutate(region = case_when(ID == 1+0 ~ "Basin",
+                            ID == 1+1 ~ "Baffin Bay",
+                            ID == 1+2 ~ "Canadian Archipelago",
+                            ID == 1+3 ~ "Beaufort Sea",
+                            ID == 1+4 ~ "Chukchi Sea",
+                            ID == 1+5 ~ "East Siberian Sea",
+                            ID == 1+6 ~ "Laptev Sea",
+                            ID == 1+7 ~ "Kara Sea",
+                            ID == 1+8 ~ "Barents Sea",
+                            ID == 1+9 ~ "Nordic Sea",
+                            TRUE ~ "NA")) 
+
+write.csv(nc_ext,paste0("Output/chla/Extracted_RAW/",
+                        gsub(".*/","",
+                                       gsub(".nc","_RAW.csv",nc_list[i]))), row.names = F,)
+
+nc_ext_summarised<-nc_ext %>% 
+  dplyr::filter(!is.na(layer),
+                !is.na(x),
+                weight>0.5) %>% 
+  group_by(region) %>% 
+  summarise(x = mean(x, na.rm = T),
+            y = mean(y, na.rm = T),
+            avg_chla = mean(layer, na.rm = T),
+            median_chla = median(layer, na.rm =T),
+            sd_chla = sd(layer, na.rm=T),
+            min_chla = min(layer),
+            max_chla = max(layer),
+            n_pxl = n(),
+            p05_chla = stats::quantile(layer,probs = 0.05 ),
+            p95_chla = stats::quantile(layer,probs = 0.95 )) %>% 
+  mutate(date = date,
+         i=i) %>% 
+  pivot_longer(-c("x","y","region","date","i"),names_to = "metrics", values_to = "values" )
+
+write.csv(nc_ext_summarised,paste0("Output/chla/Extracted_Summarised/",
+                        gsub(".*/","",
+                                       gsub(".nc","_Summarised.csv",nc_list[i]))), row.names = F)
+
+if(i == 1){
+  output<-nc_ext_summarised
+}else{
+  output<-rbind(output,nc_ext_summarised)
+}
+
+write.csv(output,paste0("Output/chla/",
+                        gsub(".*/","",
+                                       gsub(".nc","_All.csv",nc_list[i]))), row.names = F)
+} 
+
+```
+
+
+```{r}
+
+
